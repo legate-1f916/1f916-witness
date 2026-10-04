@@ -1,0 +1,78 @@
+name: witness
+
+# Countersign the 1F916 registry heads about four times an hour. Slots sit away
+# from :00 because GitHub delays and drops top-of-the-hour schedules, and it
+# delivers scheduled runs in bursts regardless of how many slots are offered
+# (measured by the liveness witness, 2026-09-09). A dropped slot is a gap in
+# the file, visible to any reader; it is never backfilled.
+on:
+  schedule:
+    - cron: '09 * * * *'
+    - cron: '24 * * * *'
+    - cron: '39 * * * *'
+    - cron: '54 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: witness
+  cancel-in-progress: false
+
+jobs:
+  countersign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The private key exists only in this repository's Actions secret and in
+      # the operator's offline backup. It is written to a gitignored path for
+      # the length of one run and never enters a commit.
+      - name: Restore witness key
+        env:
+          WITNESS_KEY_JSON: ${{ secrets.WITNESS_KEY_JSON }}
+        run: |
+          test -n "$WITNESS_KEY_JSON" || { echo "::error::WITNESS_KEY_JSON secret is not set"; exit 1; }
+          printf '%s' "$WITNESS_KEY_JSON" > witness-state/witness-key.json
+          chmod 600 witness-state/witness-key.json
+
+      # Report the gap BEFORE countersigning: after a run the newest row is
+      # always fresh and a stall becomes invisible.
+      - name: Report the gap since the last countersignature
+        run: |
+          last=$(tail -n1 witness-state/countersignatures.jsonl | sed -n 's/.*"at":"\([^"]*\)".*/\1/p')
+          if [ -n "$last" ]; then
+            gap=$(( ($(date -u +%s) - $(date -u -d "$last" +%s)) / 60 ))
+            echo "last countersignature: $last (${gap} minutes ago)"
+            echo "### witness gap: ${gap} min (last $last)" >> "$GITHUB_STEP_SUMMARY"
+            [ "$gap" -gt 180 ] && echo "::warning::witness stalled for ${gap} minutes" || true
+          fi
+
+      # The reference loop, unmodified. A refusal (failed proof, shrunk tree,
+      # vanished log, changed registry key) exits non-zero AFTER appending an
+      # unsigned evidence line; that line must still be committed, so the
+      # commit step runs regardless of this step's result.
+      - name: Countersign
+        id: countersign
+        continue-on-error: true
+        run: node witness.mjs --registry https://1f916.ai --state ./witness-state
+
+      - name: Commit and push the appended rows
+        run: |
+          rm -f witness-state/witness-key.json
+          git config user.name  "witness"
+          git config user.email "witness@users.noreply.github.com"
+          git add witness-state/countersignatures.jsonl witness-state/last-heads.json witness-state/registry-key.json
+          git diff --cached --quiet && { echo "nothing appended"; exit 0; }
+          git commit -q -m "countersign $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q
+
+      - name: Surface a refusal as a failed run
+        if: steps.countersign.outcome == 'failure'
+        run: |
+          echo "::error::the witness refused at least one head this run; the unsigned evidence line is committed"
+          exit 1
